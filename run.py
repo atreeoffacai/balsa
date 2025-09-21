@@ -25,6 +25,7 @@ import collections
 import copy
 import logging
 import os
+import csv
 import pickle
 import pprint
 import signal
@@ -73,6 +74,23 @@ flags.DEFINE_string('run', 'Balsa_JOBRandSplit', 'Experiment config to run.')
 flags.DEFINE_boolean('local', False,
                      'Whether to use local engine for query execution.')
 
+def log_tuple_as_csv(tup, filename='output_jianbian_jianhaojiushou.csv', 
+                     header=('query name', 'bs plan cost', 'mcts plan cost','bs planning time', 'mcts planning time','simulation number')):
+    is_new_file = not os.path.exists(filename)
+    with open(filename,'a',newline='',encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        if is_new_file:
+            writer.writerow(header)
+        writer.writerow(tup)
+
+def log_exetime_as_csv(tup, filename='exetime.csv', 
+                     header=('exetime','nothing')):
+    is_new_file = not os.path.exists(filename)
+    with open(filename,'a',newline='',encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        if is_new_file:
+            writer.writerow(header)
+        writer.writerow(tup)
 
 def GetDevice():
     return 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -667,8 +685,16 @@ class BalsaAgent(object):
     """The Balsa agent."""
 
     def __init__(self, params):
+        self.mctsWinCount = 0
+        self.bsWinCount = 0
+        self.bs_equal_mcts = 0
+        self.mctsWinTotalTime = 0.0
+        self.bsTotalTime = 0.0
         self.params = params.Copy()
         p = self.params
+        if p.cost_model == "mincardcost":
+            p.cost_model == "postgrescost"
+        
         print('BalsaAgent params:\n{}'.format(p))
 
         self.sim = None
@@ -1208,7 +1234,7 @@ class BalsaAgent(object):
             print(message)
             print('q{},{:.1f} (baseline)'.format(node.info['query_name'],
                                                  real_cost))
-            print('Execution time: {}'.format(real_cost))
+            print('Execution time: {}'.format(real_cost), " in func RunBaseline")
         # NOTE: if engine != pg, we're still saving PG plans but with target
         # engine's latencies.  This mainly affects debug strings.
         Save(self.workload, './data/initial_policy_data.pkl')
@@ -1278,9 +1304,13 @@ class BalsaAgent(object):
         sampled_node, _ = _Sample(node, num_internal)
         return sampled_node
 
-    def SelectPlan(self, found_plans, predicted_latency, found_plan, planner,
-                   query_node):
+    def SelectPlan(self, found_plans, # 所有找到的完整计划列表
+                   predicted_latency,  # 当前最优计划的预测延迟
+                   found_plan, # 当前最优计划
+                   planner, # 用于规划的 planner 对象
+                   query_node): # 当前正在处理的查询节点
         """Exploration + action selection."""
+        # 参数校验与配置检查：确保只启用一种探索策略。
         p = self.params
         # Sanity check that at most one exploration strategy is specified.
         num_explore_schemes = (p.epsilon_greedy + p.explore_soft_v +
@@ -1291,6 +1321,7 @@ class BalsaAgent(object):
         if p.epsilon_greedy:
             assert p.epsilon_greedy_random_transform + \
                 p.epsilon_greedy_random_plan <= 1
+        # ε-greedy 策略
         if p.epsilon_greedy > 0:
             r = np.random.rand()
             if r < p.epsilon_greedy:
@@ -1307,6 +1338,7 @@ class BalsaAgent(object):
                     predicted_latency, found_plan = planner.SampleRandomPlan(
                         query_node)
                 else:
+                    # 从已有的所有计划中随机选取一个作为新的执行计划。
                     # Randomly pick a plan from all found plans.
                     rand_idx = np.random.randint(len(found_plans))
                     predicted_latency, found_plan = found_plans[rand_idx]
@@ -1374,6 +1406,20 @@ class BalsaAgent(object):
 
         return predicted_latency, found_plan
 
+    def recordAndPrintSomeRes(self, mctsPlanCost, bsPlanCost):
+        if mctsPlanCost > bsPlanCost:
+                self.bsWinCount += 1
+        elif mctsPlanCost < bsPlanCost:
+            self.mctsWinCount += 1
+        else:
+            self.bs_equal_mcts += 1
+        self.bsTotalTime += bsPlanCost
+        self.mctsWinTotalTime += (bsPlanCost - mctsPlanCost)
+        print('mcts win fraction: ', self.mctsWinTotalTime / self.bsTotalTime * 100, '%')
+        print('bsWinCount: ', self.bsWinCount)
+        print('mctsWinCount: ', self.mctsWinCount)
+        print('bs_equal_mcts: ', self.bs_equal_mcts)
+
     def PlanAndExecute(self, model, planner, is_test=False, max_retries=3):
         p = self.params
         model.eval()
@@ -1400,10 +1446,10 @@ class BalsaAgent(object):
 
         self.timer.Start('plan_test_set' if is_test else 'plan')
         for i, node in enumerate(nodes):
-            print('---------------------------------------')
-            tup = planner.plan(
+            print('----------------------------------------------------------------------')
+            tup_mcts = planner.plan(
                 node,
-                p.search_method,
+                "mcts",
                 bushy=p.bushy,
                 return_all_found=True,
                 verbose=False,
@@ -1412,12 +1458,58 @@ class BalsaAgent(object):
                 # prevents Ext-JOB test query hints from failing.
                 avoid_eq_filters=is_test and p.avoid_eq_filters,
             )
-            planning_time, found_plan, predicted_latency, found_plans = tup
-            predicted_latency, found_plan = self.SelectPlan(
-                found_plans, predicted_latency, found_plan, planner, node)
-            print('{}q{}, predicted time: {:.1f}'.format(
-                '[Test set] ' if is_test else '', node.info['query_name'],
-                predicted_latency))
+            # tup_bs = planner.plan(
+            #     node,
+            #     "beam_bk",
+            #     bushy=p.bushy,
+            #     return_all_found=True,
+            #     verbose=False,
+            #     planner_config=planner_config,
+            #     epsilon_greedy=epsilon_greedy_within_beam_search,
+            #     # prevents Ext-JOB test query hints from failing.
+            #     avoid_eq_filters=is_test and p.avoid_eq_filters,
+            # )
+            if len(tup_mcts) == 4:
+                planning_time, found_plan, predicted_latency, found_plans = tup_mcts
+                predicted_latency, found_plan = self.SelectPlan(
+                    found_plans, predicted_latency, found_plan, planner, node)
+            elif len(tup_mcts) == 6:
+                bsPlanninTime, planning_time, found_plan, predicted_latency, bsPlan_latency, simulation_num = tup_mcts
+                # header=('query name', 'bs plan cost', 'mcts plan cost','bs planning time', 'mcts planning time','simulation number')
+                log_tuple_as_csv((node.info['query_name'],bsPlan_latency,predicted_latency, bsPlanninTime,planning_time ,simulation_num))
+                found_plans = []
+                found_plans.append((predicted_latency, found_plan))
+            mctsPlanTime = predicted_latency
+            bsPlanTime = bsPlan_latency
+
+            # print information about mcts'plan time and plan verbose
+            # print('{}q{}, mcts\'s plan predicted time: {:.1f}'.format(
+            #     '[Test set] ' if is_test else '', node.info['query_name'],
+            #     predicted_latency))
+            hint_str = HintStr(found_plan,
+                               with_physical_hints=p.plan_physical,
+                               engine=p.engine)
+            print('q{},(predicted {:.1f}),{}'.format(node.info['query_name'],
+                                                     predicted_latency,
+                                                     hint_str))
+            # if len(tup_bs) == 4:
+            #     planning_time, found_plan, predicted_latency, found_plans = tup_bs
+            #     predicted_latency, found_plan = self.SelectPlan(
+            #         found_plans, predicted_latency, found_plan, planner, node)
+            # elif len(tup_bs) == 3:
+            #     planning_time, found_plan, predicted_latency = tup_bs
+            #     found_plans = []
+            #     found_plans.append((predicted_latency, found_plan))
+            # bsPlanTime = predicted_latency
+
+            self.recordAndPrintSomeRes(mctsPlanTime, bsPlanTime)
+            
+            # print information about bs'plan time and plan verbose
+            # print('{}q{}, bs\'s predicted time: {:.1f}'.format(
+            #     '[Test set] ' if is_test else '', node.info['query_name'],
+            #     predicted_latency))
+            
+
             # Calculate monitoring info.
             predicted_costs = None
             if p.sim:
@@ -1430,7 +1522,7 @@ class BalsaAgent(object):
                 node.info['query_name']),
                               node.info['curr_predicted_latency'] / 1e3,
                               self.curr_value_iter)])
-
+            # hint 字符串
             hint_str = HintStr(found_plan,
                                with_physical_hints=p.plan_physical,
                                engine=p.engine)
@@ -1444,9 +1536,11 @@ class BalsaAgent(object):
                 curr_timeout = 1100000
             else:
                 curr_timeout = self.timeout_controller.GetTimeout(node)
+            # 打印 hint 信息
             print('q{},(predicted {:.1f}),{}'.format(node.info['query_name'],
                                                      predicted_latency,
                                                      hint_str))
+            # 加入待执行
             to_execute.append((node.info['sql_str'], hint_str, planning_time,
                                found_plan, predicted_latency, curr_timeout))
             if p.use_cache:
@@ -1501,7 +1595,7 @@ class BalsaAgent(object):
                 wandb.Histogram(positions_of_min_predicted),
         })
         # Wait for all execution of the planned queries.
-        print('{}Waiting on Ray tasks...value_iter={}'.format(
+        print('{}Waiting on Ray tasks...value_iter={} in func PlanAndExecute'.format(
             '[Test set] ' if is_test else '', self.curr_value_iter))
         try:
             refs = ray.get(tasks)
@@ -1592,6 +1686,7 @@ class BalsaAgent(object):
             assert len(result_tups) == 4
             print(result_tups[-1])  # Messages.
             execution_results.append(result_tups[:-1])
+            log_exetime_as_csv([result_tups[1],0])
             # Increment counts for training.
             if not is_test:
                 if is_cached_plan:
