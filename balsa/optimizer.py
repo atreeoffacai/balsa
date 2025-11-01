@@ -156,94 +156,95 @@ class Optimizer(object):
 
     # @profile
     def infer(self, query_node, plan_nodes, set_model_eval=False):
-        """Forward pass.
+        """
+        执行前向传递以对给定计划进行评分。
 
         Args:
-            query_node: a plans_lib.Node object. Represents the query context.
-            plan_nodes: a list of plans_lib.Node objects. The set of plans to
-              score.
+            query_node: 一个 plans_lib.Node 对象，表示查询上下文。
+            plan_nodes: 一个 plans_lib.Node 对象列表，需要评分的计划集合。
+            set_model_eval: 布尔值，默认为 False。如果为 True，则设置模型为评估模式（关闭 dropout 等）。
 
         Returns:
-            costs, a float. Higher costs indicate more expensive plans.
+            costs: 返回一个 float 列表，成本越高代表计划越昂贵。
         """
+        # 初始化 labels 列表，用于存储每个计划的成本标签，初始值为 None。
         labels = [None] * len(plan_nodes)
+        # 初始化 plans 和 idx 列表，plans 存储未缓存的计划，idx 存储这些计划在原始列表中的索引。
         plans, idx = [], []
+
+        # 如果使用 label cache 来加速重复查询的处理。
         if self.use_label_cache:
-            # Gather cached labels
-            lookup_keys = [(query_node.info['query_name'],
-                            plan.to_str(with_cost=False))
-                           for plan in plan_nodes]
+            # 创建 lookup_keys 列表，键由查询名称和计划字符串组成，用于查找已缓存的成本标签。
+            lookup_keys = [(query_node.info['query_name'], plan.to_str(with_cost=False)) for plan in plan_nodes]
             for i, lookup_key in enumerate(lookup_keys):
+                # 尝试从缓存中获取对应计划的成本标签。
                 label = self.label_cache.get(lookup_key)
                 if label is not None:
+                    # 若找到，将对应的标签添加到 labels 列表。
                     labels[i] = label
                 else:
+                    # 若未找到，保存该计划及其索引，以便后续计算。
                     plans.append(plan_nodes[i])
                     idx.append(i)
-            # No plans to score.
+
+            # 如果所有计划都在缓存中找到了对应的成本标签，则直接返回。
             if len(plans) == 0:
                 return labels
         else:
+            # 如果不使用缓存，则直接将所有计划作为新计划处理。
             plans = plan_nodes
 
-        # Perform inference on new plans.
+        # 对新计划执行推理过程。
         if set_model_eval:
-            # Expensive.  Caller should try to call only once.
+            # 设置网络为评估模式，通常在测试时使用，关闭如 dropout 等训练专用层。
+            # 注意：这一步操作较为耗时，建议调用者尽量减少调用次数。
             self.value_network.eval()
+
         with torch.no_grad():
+            # 获取查询特征编码。
             query_enc = self.query_featurizer(query_node)
             all_query_vecs = [query_enc] * len(plans)
-            all_plans = []
-            all_indexes = []
+            
+            all_plans, all_indexes = [], []
             if self.tree_conv:
-                all_plans, all_indexes = treeconv.make_and_featurize_trees(
-                    plans, self.plan_featurizer)
+                # 使用 TreeConv 特征化器处理计划。
+                all_plans, all_indexes = treeconv.make_and_featurize_trees(plans, self.plan_featurizer)
             else:
+                # 遍历每个计划，使用 plan_featurizer 提取其特征。
                 for plan_node in plans:
                     all_plans.append(self.plan_featurizer(plan_node))
-
+                
+                # 如果定义了 parent_pos_featurizer，则进一步提取父节点位置信息。
                 if self.parent_pos_featurizer is not None:
                     for plan_node in plans:
-                        all_indexes.append(
-                            self.parent_pos_featurizer(plan_node))
+                        all_indexes.append(self.parent_pos_featurizer(plan_node))
 
+            # 根据是否使用 TreeConv 或 plan_featurizer 是否支持 pad 属性，选择相应的输入数据处理方式。
             if self.tree_conv or hasattr(self.plan_featurizer, 'pad'):
-                query_feat = torch.from_numpy(np.asarray(all_query_vecs)).to(
-                    DEVICE, non_blocking=True)
-                plan_feat = torch.from_numpy(np.asarray(all_plans)).to(
-                    DEVICE, non_blocking=True)
-                pos_feat = torch.from_numpy(np.asarray(all_indexes)).to(
-                    DEVICE, non_blocking=True)
-                cost = self.value_network(query_feat, plan_feat,
-                                          pos_feat).cpu().numpy()
+                query_feat, plan_feat, pos_feat = map(lambda x: torch.from_numpy(np.asarray(x)).to(DEVICE, non_blocking=True),
+                                                    [all_query_vecs, all_plans, all_indexes])
+                cost = self.value_network(query_feat, plan_feat, pos_feat).cpu().numpy()
             else:
+                # 处理没有 TreeConv 的情况，通过 PlansDataset 构建数据集并加载数据进行预测。
                 all_costs = [1] * len(all_plans)
-                batch = ds.PlansDataset(
-                    all_query_vecs,
-                    all_plans,
-                    all_indexes,
-                    all_costs,
-                    transform_cost=False,
-                    return_indexes=False,
-                )
-                loader = torch.utils.data.DataLoader(batch,
-                                                     batch_size=len(all_plans),
-                                                     shuffle=False)
+                batch = ds.PlansDataset(all_query_vecs, all_plans, all_indexes, all_costs, transform_cost=False, return_indexes=False)
+                loader = torch.utils.data.DataLoader(batch, batch_size=len(all_plans), shuffle=False)
                 processed_batch = list(loader)[0]
-                query_feat, plan_feat = processed_batch[0].to(
-                    DEVICE), processed_batch[1].to(DEVICE)
+                query_feat, plan_feat = map(lambda x: x.to(DEVICE), processed_batch[:2])
                 cost = self.value_network(query_feat, plan_feat).cpu().numpy()
 
+            # 应用逆变换，将模型输出转换回原始的成本空间。
             cost = self.inverse_label_transform_fn(cost)
             plan_labels = cost.reshape(-1,).tolist()
 
+            # 更新缓存，并根据 idx 列表更新 labels 中相应位置的值。
             if self.use_label_cache:
-                # Update the cache with the labels.
                 for i in range(len(plan_labels)):
                     labels[idx[i]] = plan_labels[i]
                     self.label_cache[lookup_keys[idx[i]]] = plan_labels[i]
             else:
                 labels = plan_labels
+
             return labels
 
     def plan(self, query_node, search_method, **kwargs):

@@ -15,11 +15,11 @@
 
 Usage:
 
-    # Experiment configs are declared in experiments.py.
-    # Look up the name and pass --run <name>.
+    # 实验配置在 experiments.py 中定义。
+    # 查找配置名称，并通过 --run <name> 传入。
     python -u run.py --run <name> 2>&1 | tee run.log
 
-Use Main() to modify hparams for debugging.
+调试时，可通过 Main() 函数修改超参数(hparams)。
 """
 import collections
 import copy
@@ -68,17 +68,43 @@ from pg_executor import dbmsx_executor
 import train_utils
 import experiments  # noqa # pylint: disable=unused-import
 
+# 允许用户通过命令行灵活控制程序行为，而无需修改源码。
 FLAGS = flags.FLAGS
+# 三个参数分别代表：选项名称、默认值、帮助信息。
 flags.DEFINE_string('run', 'Balsa_JOBRandSplit', 'Experiment config to run.')
 flags.DEFINE_boolean('local', False,
                      'Whether to use local engine for query execution.')
 
 
 def GetDevice():
+    """返回可用的计算设备。
+
+    通过 PyTorch 检查 CUDA 是否可用，若可用则返回 'cuda'，
+    否则返回 'cpu'。
+
+    返回：
+    设备名称，字符串类型：'cuda' 或 'cpu'。
+    """
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def Save(obj, path):
+    """将 Python 对象序列化并保存到指定路径。
+
+    该函数会自动创建目标文件所在的目录（若不存在），
+    然后使用 pickle 将对象以二进制格式写入文件。
+
+    Args:
+        obj: 要保存的任意可序列化 Python 对象。
+        path (str): 保存文件的完整路径（包括文件名）。
+
+    Returns:
+        str: 成功保存的文件路径。
+
+    Raises:
+        pickle.PicklingError: 如果对象无法被序列化。
+        OSError: 如果文件或目录无法创建或写入。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(obj, f)
@@ -86,6 +112,23 @@ def Save(obj, path):
 
 
 def SaveText(text, path):
+    """将文本内容安全地写入指定文件路径。
+
+    该函数首先创建目标文件所在目录（若不存在），
+    然后将文本写入一个临时文件（路径为 <path>.tmp），
+    最后通过原子操作 `os.replace` 将临时文件替换为目标文件。
+    此方法可避免因程序崩溃或中断导致文件损坏或内容不完整。
+
+    Args:
+        text (str): 要写入的文本内容。
+        path (str): 目标文件的完整路径（不包含扩展名，函数会自动处理）。
+
+    Returns:
+        str: 成功保存后的目标文件路径。
+
+    Raises:
+        OSError: 如果目录无法创建、临时文件无法写入，或替换操作失败。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + '.tmp', 'w') as f:
         f.write(text)
@@ -95,7 +138,39 @@ def SaveText(text, path):
 
 
 def MakeModel(p, exp, dataset):
+    """根据配置参数、实验设置和数据集构建并返回一个深度学习模型实例。
+
+    该函数会自动检测可用设备（CPU 或 CUDA），并根据参数 `p.tree_conv` 
+    选择使用树卷积模型（TreeConvolution）或 Transformer 类模型（Transformer / TransformerV2）。
+    模型的输入维度、词表大小、标签数量等均从 `exp` 和 `dataset` 中动态推导。
+
+    Args:
+        p (argparse.Namespace 或类似对象): 包含模型超参数的配置对象，
+            至少需包含以下属性：
+            - tree_conv (bool): 是否使用树卷积架构。
+            - tree_conv_version (int): 树卷积版本号（若启用）。
+            - v2 (bool): 是否使用 TransformerV2（否则使用 Transformer）。
+            - pos_embs (bool): 是否启用位置嵌入。
+            - dropout (float): Dropout 概率。
+            - cross_entropy (bool): 是否使用交叉熵损失（影响输出维度）。
+        exp (Experiment): 实验配置对象，需提供：
+            - query_featurizer(node): 查询特征提取器。
+            - featurizer(node): 计划特征提取器（需支持 pad() 方法）。
+            - pos_featurizer(node): 位置特征提取器（需支持 pad() 方法）。
+            - nodes: 用于推导特征维度的示例节点列表。
+        dataset (object): 数据集对象，需包含 `costs` 属性（torch.Tensor），
+            用于计算标签分箱数量（label bins）。
+
+    Returns:
+        torch.nn.Module: 已移至正确设备（CPU/GPU）的模型实例。
+
+    Raises:
+        AssertionError: 如果从 `exp.featurizer` 提取的特征不是一维张量。
+        AttributeError: 如果输入对象缺少必要的方法或属性（如 pad(), costs 等）。
+    """
     dev = GetDevice()
+    # ？？？
+    # 下面这行代码好像是属于分类？
     num_label_bins = int(
         dataset.costs.max().item()) + 2  # +1 for 0, +1 for ceil(max cost).
     query_feat_size = len(exp.query_featurizer(exp.nodes[0]))
@@ -103,13 +178,13 @@ def MakeModel(p, exp, dataset):
     assert batch.ndim == 1
     plan_feat_size = batch.shape[0]
 
-    if p.tree_conv:
+    if p.tree_conv: # 树卷积 模型
         labels = num_label_bins if p.cross_entropy else 1
         return TreeConvolution(feature_size=query_feat_size,
                                plan_size=plan_feat_size,
                                label_size=labels,
                                version=p.tree_conv_version).to(dev)
-    else:
+    else: # 下面代码是 Transformer 模型.
         plan_vocab_size = exp.featurizer.pad() + 1  # +1 for PAD.
         parent_pos_vocab_size = exp.pos_featurizer.pad() + 1
         d_model = 256
@@ -150,26 +225,26 @@ def ExecuteSql(query_name,
                plan_physical=True,
                repeat=1,
                engine='postgres'):
-    """Executes a query.
-
-    Returns:
-      If use_local_execution:
-        A (pg_executor, dbmsx_executor).Result.
-      Else:
-        A ray.ObjectRef of the above.
+    """执行一条 SQL 查询。
+    返回值：
+      如果 use_local_execution=True：
+        返回一个 (pg_executor, dbmsx_executor).Result 类型的结果对象。
+      否则：
+        返回上述结果的 Ray 对象引用（ray.ObjectRef），需通过 ray.get() 获取实际结果。
     """
-    # Unused args.
+    # 未使用的参数（保留接口兼容性，但函数内部不使用）
     del query_name, hinted_plan, query_node, predicted_latency, found_plans,\
         predicted_costs, silent, is_test, plan_physical
-
+    # 断言：只支持 'postgres' 或 'dbmsx' 两种执行引擎
     assert engine in ('postgres', 'dbmsx'), engine
     if engine == 'postgres':
-        return postgres.ExplainAnalyzeSql(sql_str,
-                                          comment=hint_str,
+        # 使用 PostgreSQL 执行并分析 SQL（带执行计划和实际耗时）
+        return postgres.ExplainAnalyzeSql(sql_str, # 待执行SQL
+                                          comment=hint_str, # hint
                                           verbose=False,
-                                          geqo_off=True,
+                                          geqo_off=True, # 关闭 GEQO 优化器
                                           timeout_ms=curr_timeout_ms,
-                                          remote=not use_local_execution)
+                                          remote=not use_local_execution) # 若 use_local_execution=False，则通过 Ray 远程执行
     else:
         return DbmsxExecuteSql(sql_str,
                                comment=hint_str,
@@ -179,7 +254,7 @@ def ExecuteSql(query_name,
 
 
 def AddCommentToSql(sql_str, comment, engine):
-    """Adds a comment (hint string) to a SQL string."""
+    """向 SQL 字符串中添加一条注释（提示字符串）。"""
     fns = {
         'postgres': PostgresAddCommentToSql,
         'dbmsx': DbmsxAddCommentToSql,
@@ -210,6 +285,22 @@ def DbmsxNodeToHintStr(node, with_physical_hints=False):
 
 
 def HintStr(node, with_physical_hints, engine):
+    """根据指定的数据库引擎，从查询计划节点生成对应的 SQL 提示字符串（hint string）。
+
+    该函数将查询计划节点（如连接顺序、访问路径等）转换为数据库可识别的提示注释，
+    用于引导查询优化器生成特定的执行计划。
+
+    Args:
+        node: 查询计划树中的一个节点对象，需支持 `hint_str()` 方法（PostgreSQL 路径）。
+        with_physical_hints (bool): 是否包含物理操作符提示（如索引扫描、连接算法等）。
+        engine (str): 目标数据库引擎，目前支持 'postgres' 和 'dbmsx'。
+
+    Returns:
+        str: 生成的提示字符串，可作为 SQL 注释嵌入查询语句中。
+
+    Raises:
+        AssertionError: 如果 `engine` 不是 'postgres' 或 'dbmsx'。
+    """
     if engine == 'postgres':
         return node.hint_str(with_physical_hints=with_physical_hints)
     assert engine == 'dbmsx', engine
@@ -232,6 +323,47 @@ def ParseExecutionResult(result_tup,
                          plan_physical=True,
                          repeat=None,
                          engine='postgres'):
+    """解析 SQL 查询的执行结果，验证提示是否被遵守，并生成调试/日志信息。
+
+    该函数主要完成以下任务：
+    1. 从执行结果中提取真实执行时间（real_cost），超时则记为 -1；
+    2. （若启用了提示）验证数据库实际执行的计划是否与预期提示一致；
+    3. 生成包含查询信息、执行时间、预测延迟、候选计划等的详细日志；
+    4. 支持 PostgreSQL 和 DBMS-X 引擎（DBMS-X 的提示验证暂未实现）。
+
+    Args:
+        result_tup: 包含执行结果的对象，需具备以下属性：
+            - result: 原始执行结果（如 PostgreSQL 的 JSON 计划）；
+            - has_timeout (bool): 是否因超时中断；
+            - server_ip (str): 执行该查询的服务器 IP（用于分布式调试）。
+        query_name (str): 查询名称（如 "Q1", "JOB-3a"）。
+        sql_str (str): 原始 SQL 语句。
+        hint_str (str or None): 本次执行使用的提示字符串；若为 None，表示运行基线（baseline）。
+        hinted_plan: 与 hint_str 对应的计划节点对象。
+        query_node: 原始查询对应的计划节点，包含专家计划（expert plan）等信息。
+        predicted_latency (float): 模型预测的执行延迟（毫秒）。
+        curr_timeout_ms (int, optional): 当前查询的超时阈值（毫秒）。
+        found_plans (list of tuples, optional): 搜索阶段发现的候选计划列表，
+           每个元素为 (predicted_latency, plan_node)。
+        predicted_costs (list of float, optional): 对应 found_plans 中每个计划的预测代价。
+        silent (bool): 是否抑制详细日志输出。
+        is_test (bool): 是否为测试集查询（影响日志前缀）。
+        use_local_execution (bool): 是否本地执行（此处未使用，保留接口兼容性）。
+        plan_physical (bool): 在生成提示字符串时，是否包含物理操作符（如 IndexScan）。
+        repeat (any): 保留参数，当前未使用。
+        engine (str): 数据库引擎，支持 'postgres'（默认）或 'dbmsx'。
+
+    Returns:
+        tuple: 包含以下元素：
+            - result_tup: 原始结果对象（透传）；
+            - real_cost (float): 实际执行时间（毫秒），超时则为 -1；
+            - server_ip (str): 执行服务器 IP；
+            - log_message (str): 拼接后的完整日志字符串（多行）。
+
+    Raises:
+        AssertionError: 如果提示未被遵守（且非超时情况），会触发断言失败并进入调试器（ipdb）。
+        NotImplementedError: 若 engine='dbmsx' 且启用了提示验证（当前未实现）。
+    """
     del repeat  # Unused.
     messages = []
     result = result_tup.result
@@ -239,6 +371,7 @@ def ParseExecutionResult(result_tup,
     server_ip = result_tup.server_ip
     if has_timeout:
         assert not result, result
+    # --- 获得真实执行时间 --->
     if engine == 'dbmsx':
         real_cost = -1 if has_timeout else result_tup.latency
     else:
@@ -247,6 +380,8 @@ def ParseExecutionResult(result_tup,
         else:
             json_dict = result[0][0][0]
             real_cost = json_dict['Execution Time']
+    # <----------------------
+    # ---提示验证（仅在提供了 hint_str 且非基线运行时进行）--->
     if hint_str is not None:
         # Check that the hint has been respected.  No need to check if running
         # baseline.
@@ -257,8 +392,7 @@ def ParseExecutionResult(result_tup,
             if not has_timeout:
                 executed_node = postgres.ParsePostgresPlanJson(json_dict)
             else:
-                # Timeout has occurred & 'result' is empty.  Fallback to
-                # checking against local Postgres.
+                # 超时时，回退到本地 PostgreSQL 重新生成计划用于验证
                 print('Timeout occurred; checking the hint against local PG.')
                 executed_node, _ = postgres.SqlToPlanNode(sql_str,
                                                           comment=hint_str,
@@ -266,6 +400,8 @@ def ParseExecutionResult(result_tup,
             executed_node = plans_lib.FilterScansOrJoins(executed_node)
             executed_hint_str = executed_node.hint_str(
                 with_physical_hints=plan_physical)
+        
+        # 检查提示是否被遵守
         if do_hint_check and hint_str != executed_hint_str:
             print('initial\n', hint_str)
             print('after\n', executed_hint_str)
@@ -277,7 +413,7 @@ def ParseExecutionResult(result_tup,
                 print(e, flush=True)
                 import ipdb
                 ipdb.set_trace()
-
+    # 生成基础日志信息
     if not silent:
         messages.append('{}Running {}: hinted plan\n{}'.format(
             '[Test set] ' if is_test else '', query_name, hinted_plan))
@@ -290,16 +426,20 @@ def ParseExecutionResult(result_tup,
             '{} Execution time: {:.1f} (predicted {:.1f}) curr_timeout_ms={}'.
             format(query_name, real_cost, predicted_latency, curr_timeout_ms))
 
+    # 若为基线运行（无提示）或静默模式，跳过详细计划日志
     if hint_str is None or silent:
         # Running baseline: don't print debug messages below.
         return result_tup, real_cost, server_ip, '\n'.join(messages)
 
+    # 添加专家计划（expert plan）信息
     messages.append('Expert plan: latency, predicted, hint')
     expert_hint_str = query_node.hint_str()
     expert_hint_str_physical = query_node.hint_str(with_physical_hints=True)
     messages.append('  {:.1f} (predicted {:.1f})  {}'.format(
         query_node.cost, query_node.info['curr_predicted_latency'],
         expert_hint_str))
+    
+    # 添加搜索阶段发现的候选计划信息
     if found_plans:
         if predicted_costs is None:
             predicted_costs = [None] * len(found_plans)
@@ -331,6 +471,22 @@ def ParseExecutionResult(result_tup,
 
 
 def _GetQueryFeaturizerClass(p):
+    """根据配置参数 p 中的 `sim_query_featurizer` 字段，返回对应的查询特征提取器类。
+
+    该函数支持多种特征提取器实现，用于将查询计划或查询结构转换为模型可处理的数值特征向量。
+    支持的选项包括：
+      - 布尔值 True/False：向后兼容旧配置（True 表示使用 SimQueryFeaturizer，False 表示使用基础 QueryFeaturizer）；
+      - 字符串标识符：如 'SimQueryFeaturizerV2' 等，用于指定具体版本的高级特征提取器。
+
+    Args:
+        p (argparse.Namespace 或类似对象): 包含配置参数的对象，必须具有 `sim_query_featurizer` 属性。
+
+    Returns:
+        class: 对应的特征提取器类（如 sim_lib.SimQueryFeaturizer 或 plans_lib.QueryFeaturizer）。
+
+    Raises:
+        KeyError: 如果 p.sim_query_featurizer 的值不在预定义的映射中。
+    """
     return {
         True: sim_lib.SimQueryFeaturizer,
         False: plans_lib.QueryFeaturizer,
@@ -341,6 +497,38 @@ def _GetQueryFeaturizerClass(p):
 
 
 def TrainSim(p, loggers=None):
+    """根据给定的配置参数训练一个查询代价预测模型（Sim 模型）。
+
+    该函数完成以下主要流程：
+    1. 从输入参数 `p` 中提取相关配置，构建 `sim_lib.Sim` 的参数对象 `sim_p`；
+    2. 根据是否启用物理操作符（`plan_physical`）选择合适的计划特征提取器；
+    3. 若未提供预训练检查点（`sim_checkpoint`），则先执行模拟数据收集（CollectSimulationData）；
+    4. 训练模型（支持从检查点恢复）；
+    5. 冻结训练好的模型权重；
+    6. 在验证集上评估代价预测性能；
+    7. 释放训练数据以节省内存。
+
+    Args:
+        p (argparse.Namespace 或类似配置对象): 包含训练所需的所有超参数和路径配置，
+            必须包含以下关键字段（部分）：
+            - query_dir, query_glob: 训练查询文件路径与通配符；
+            - test_query_glob: 测试查询通配符；
+            - cost_model: 代价模型类型（如 'mincardcost' 或 'postgres'）；
+            - search_method, beam, search_until_n_complete_plans: 搜索策略相关参数；
+            - plan_physical: 是否使用物理操作符（影响特征提取器选择）；
+            - sim_checkpoint: 预训练模型检查点路径（可选）；
+            - bs, epochs, loss_type, gradient_clip_val 等训练超参。
+        loggers (list of pytorch_lightning.loggers.Logger, optional): 
+            用于记录训练过程的日志记录器（如 TensorBoardLogger、WandbLogger 等）。
+
+    Returns:
+        sim_lib.Sim: 训练完成并冻结权重的 Sim 实例，可用于后续推理或评估。
+
+    Side Effects:
+        - 若 `p.sim_checkpoint is None`，会执行耗时的模拟数据收集（CollectSimulationData）；
+        - 训练过程中会占用 GPU/内存资源；
+        - 调用 `sim.FreeData()` 后，训练数据将被释放，无法再次训练（除非重新收集）。
+    """
     sim_p = sim_lib.Sim.Params()
     # Copy over relevant params.
     sim_p.workload.query_dir = p.query_dir
@@ -360,7 +548,7 @@ def TrainSim(p, loggers=None):
     sim_p.infer_search_until_n_complete_plans = p.search_until_n_complete_plans
     if p.plan_physical:
         sim_p.plan_physical = True
-        # Use a physical-aware plan featurizer.
+        # 使用一个感知物理操作的计划特征提取器。
         sim_p.plan_featurizer_cls = plans_lib.PhysicalTreeNodeFeaturizer
     sim_p.generic_ops_only_for_min_card_cost = \
         p.generic_ops_only_for_min_card_cost
@@ -373,7 +561,7 @@ def TrainSim(p, loggers=None):
     sim_p.perturb_query_features = p.perturb_query_features
     sim_p.validate_fraction = p.validate_fraction
 
-    # Instantiate.
+    # 实例化.
     sim = sim_lib.Sim(sim_p)
     if p.sim_checkpoint is None:
         sim.CollectSimulationData()
@@ -390,46 +578,41 @@ def InitializeModel(p,
                     soft_assign_tau=0.0,
                     soft_assign_use_ema=False,
                     ema_source_tm1=None):
-    """Initializes model weights.
+    """初始化模型权重。
 
-    Given model_(t-1), sim, ..., ema_source_tm1, initializes model_t as follows.
+    给定 model_(t-1)、sim、...、ema_source_tm1，按如下方式初始化 model_t。
 
-    If soft_assign_use_ema is False:
+    如果 soft_assign_use_ema 为 False：
 
-        model := soft_assign_tau*model + (1-soft_assign_tau)*sim.
+        model := soft_assign_tau * model + (1 - soft_assign_tau) * sim。
 
-        In particular:
-        - soft_assign_tau = 0 means always reinitializes 'model' with 'sim'.
-        - soft_assign_tau = 1 means don't reinitialize 'model'; keep training it
-            across value iterations.
+        具体而言：
+        - soft_assign_tau = 0 表示总是用 'sim' 重新初始化 'model'。
+        - soft_assign_tau = 1 表示不重新初始化 'model'；在值迭代过程中持续训练它。
 
-        A value of 0.1 seems to perform well.
+        实验表明，取值 0.1 效果较好。
 
-    Otherwise, use an exponential moving average of "source networks":
+    否则，使用“源网络”的指数移动平均（EMA）：
 
         source_t = soft_assign_tau * source_(t-1)
-                     + (1-soft_assign_tau) model_(t-1)
+                   + (1 - soft_assign_tau) * model_(t-1)
         model_t := source_t
 
-        In particular:
-        - soft_assign_tau = 0 means don't reinitialize 'model'; keep training it
-            across value iterations.
-        - soft_assign_tau = 1 means always reinitializes 'model' with 'sim'.
+        具体而言：
+        - soft_assign_tau = 0 表示不重新初始化 'model'；在值迭代过程中持续训练它。
+        - soft_assign_tau = 1 表示总是用 'sim' 重新初始化 'model'。
 
-        A value of 0.05 seems to perform well.
+        实验表明，取值 0.05 效果较好。
 
-    For both schemes, before training 'model' for the very first time it is
-    always initialized with the simulation model 'sim'.
+    对于上述两种方案，在首次训练 'model' 之前，总是使用仿真模型 'sim' 进行初始化。
 
     Args:
-      p: params.
-      model: current iteration's value model.
-      sim: the trained-in-sim model.
-      soft_assign_tau: if positive, soft initializes 'model' using the formula
-        described above.
-      soft_assign_use_ema: whether to use an exponential moving average of
-        "source networks".
-      ema_source_tm1: the EMA of source networks at iteration t-1.
+      p: 参数配置对象。
+      model: 当前迭代的值函数模型。
+      sim: 在仿真中训练好的模型。
+      soft_assign_tau: 若为正数，则使用上述公式对 'model' 进行软初始化。
+      soft_assign_use_ema: 是否使用“源网络”的指数移动平均。
+      ema_source_tm1: 上一次迭代（t-1）时源网络的 EMA。
     """
 
     def Rename(state_dict):
@@ -504,7 +687,7 @@ def InitializeModel(p,
 
 
 class BalsaModel(pl.LightningModule):
-    """Wraps an nn.Module into a pl.LightningModule."""
+    """将一个 nn.Module 封装为 pl.LightningModule。"""
 
     def __init__(self,
                  params,
@@ -1006,63 +1189,96 @@ class BalsaAgent(object):
         self.LogScalars(data)
 
     def _MakeModel(self, dataset, train_from_scratch=False):
-        p = self.params
+        """
+        构建或复用模型实例，并根据训练阶段和配置进行初始化或权重加载。
+
+        参数:
+            dataset: 用于模型初始化的数据集对象，需包含特定属性（如 TorchInvertCost）。
+            train_from_scratch (bool): 是否强制从零开始训练（忽略已有模型权重）。
+        
+        返回:
+            BalsaModel: 包装后的 PyTorch Lightning 模型实例。
+        """
+        p = self.params  # 获取训练参数配置
+
+        # 判断是否需要从头初始化模型：
+        #   - 如果 self.model 尚未创建（首次调用），或
+        #   - 配置 p.skip_sim_init_iter_1p 为 True（表示在迭代 >=1 时强制重新初始化）
         if not hasattr(self, 'model') or p.skip_sim_init_iter_1p:
-            # Init afresh if either the model has not been constructed, or if
-            # 'p.skip_sim_init_iter_1p', which explicitly says we want a fresh
-            # model on iters >= 1.
-            print('MakeModel afresh')
+            print('MakeModel afresh')  # 打印日志：从头创建模型
+            # 调用全局函数 MakeModel 创建新模型
             model = MakeModel(p, self.exp, dataset)
         else:
-            # Some training was performed before.  Weights would be
-            # re-initialized by InitializeModel() below.
+            # 已存在训练过的模型，复用其结构（但权重可能被重新初始化）
             model = self.model
+
+        # 打印当前迭代轮次，便于调试
         print('InitializeModel curr_value_iter={}'.format(self.curr_value_iter))
+
+        # 如果启用了仿真（simulation）模式
         if p.sim:
+            # 判断是否应跳过初始化：
+            #   - 仅当 p.skip_sim_init_iter_1p 为 True 且已有模型时跳过
             should_skip = p.skip_sim_init_iter_1p and hasattr(self, 'model')
             if not should_skip:
+                # 默认硬赋值（tau=0.0），即完全用仿真模型覆盖当前模型
                 soft_assign_tau = 0.0
+
+                # 若配置了 param_tau（软更新系数）且已有模型，则允许软赋值
                 if p.param_tau and hasattr(self, 'model'):
                     # Allows soft assign only if some training has been done.
                     soft_assign_tau = p.param_tau
+
+                # 如果明确要求从零训练，则强制 tau=0（禁用软更新）
                 if train_from_scratch:
                     print('Training from scratch; forcing tau := 0.')
                     soft_assign_tau = 0.0
+
+                # 调用 InitializeModel，用仿真模型（或 EMA 源网络）初始化当前模型
                 self.ema_source_net = InitializeModel(
                     p,
-                    model,
-                    self.GetOrTrainSim(),
-                    soft_assign_tau=soft_assign_tau,
-                    soft_assign_use_ema=p.use_ema_source,
-                    ema_source_tm1=self.ema_source_net)
+                    model,  # 目标模型（将被初始化）
+                    self.GetOrTrainSim(),  # 仿真模型（源）
+                    soft_assign_tau=soft_assign_tau,  # 软更新系数
+                    soft_assign_use_ema=p.use_ema_source,  # 是否使用 EMA 源
+                    ema_source_tm1=self.ema_source_net)  # 上一轮的 EMA 源（用于更新）
+
+        # 如果未启用仿真，但 param_tau 为 0.0（即要求完全随机初始化）
         elif p.param_tau == 0.0:
             print('Reset model to randomized weights!')
-            model.reset_weights()
+            model.reset_weights()  # 将模型权重重置为随机初始值
 
-        # Wrap it to get pytorch_lightning niceness.
+        # 将原始模型包装为 BalsaModel（PyTorch Lightning 兼容格式）
         model = BalsaModel(
             p,
-            model,
+            model,  # 底层 nn.Module 模型
             loss_type=p.loss_type,
-            torch_invert_cost=dataset.TorchInvertCost,
-            query_featurizer=self.exp.query_featurizer,
-            perturb_query_features=p.perturb_query_features,
-            l2_lambda=p.l2_lambda,
+            torch_invert_cost=dataset.TorchInvertCost,  # 用于损失计算的成本反转函数
+            query_featurizer=self.exp.query_featurizer,  # 查询特征化器
+            perturb_query_features=p.perturb_query_features,  # 是否扰动查询特征
+            l2_lambda=p.l2_lambda,  # L2 正则化系数
             learning_rate=self.lr_schedule.Get()
             if self.adaptive_lr_schedule is None else
-            self.adaptive_lr_schedule.Get(),
-            optimizer_state_dict=self.prev_optimizer_state_dict,
-            reduce_lr_within_val_iter=p.reduce_lr_within_val_iter)
+            self.adaptive_lr_schedule.Get(),  # 学习率（支持自适应调度）
+            optimizer_state_dict=self.prev_optimizer_state_dict,  # 优化器状态（用于恢复）
+            reduce_lr_within_val_iter=p.reduce_lr_within_val_iter)  # 是否在验证迭代内降学习率
+
+        # 打印当前迭代轮次和使用的学习率
         print('iter', self.curr_value_iter, 'lr', model.learning_rate)
+
+        # 如果提供了 agent_checkpoint 且当前是第 0 轮迭代，则加载预训练检查点
         if p.agent_checkpoint is not None and self.curr_value_iter == 0:
+            # 加载 checkpoint（兼容 CPU/GPU）
             ckpt = torch.load(p.agent_checkpoint,
-                              map_location=lambda storage, loc: storage)
-            model.load_state_dict(ckpt['state_dict'])
-            self.model = model.model
-            print('Loaded value network checkpoint at iter',
-                  self.curr_value_iter)
+                            map_location=lambda storage, loc: storage)
+            model.load_state_dict(ckpt['state_dict'])  # 加载模型权重
+            self.model = model.model  # 更新内部模型引用
+            print('Loaded value network checkpoint at iter', self.curr_value_iter)
+
+        # 在第 0 轮迭代时，打印模型结构和参数量统计
         if self.curr_value_iter == 0:
             ReportModel(model)
+
         return model
 
     def _MakeTrainer(self, train_loader):
@@ -1215,46 +1431,78 @@ class BalsaAgent(object):
         self.LogExpertExperience(self.train_nodes, self.test_nodes)
 
     def Train(self, train_from_scratch=False):
-        p = self.params
+        """
+        执行模型训练流程。
+
+        参数:
+            train_from_scratch (bool): 是否从零开始训练（不加载预训练权重）。
+        """
+        p = self.params  # 获取训练参数配置
+
+        # 启动名为 'train' 的计时器，用于记录训练耗时
         self.timer.Start('train')
+
+        # 构建训练和验证数据集及对应的 DataLoader。
+        # 如果不是从零训练（即继续训练），则记录日志；否则不记录（避免冗余日志）
         train_ds, train_loader, _, val_loader = self._MakeDatasetAndLoader(
             log=not train_from_scratch)
-        # Fields accessed: 'costs' (for p.cross_entropy; unused);
-        # 'TorchInvertCost', 'InvertCost'.  We don't access the actual data.
-        # Thus, it doesn't matter if we use a Dataset referring to the entire
-        # data or just the train data.  (Subset.dataset returns the entire
-        # original data is where the subset is sampled.)
-        #
-        # The else branch is for when self.exp_val is not None
-        # (p.prev_replay_buffers_glob_val).
+
+        # 注释说明：
+        # 下面将使用 plans_dataset 来初始化模型。该数据集仅用于访问某些元信息字段，
+        # 如 'costs'（用于交叉熵，但实际未使用）、'TorchInvertCost'、'InvertCost'。
+        # 注意：我们并不访问原始数据本身，因此无论使用完整数据集还是训练子集都无影响。
+        # 若 train_ds 是 Subset 类型（例如通过 torch.utils.data.random_split 生成），
+        # 则 .dataset 属性指向原始完整数据集；否则 train_ds 本身就是完整数据集。
         plans_dataset = train_ds.dataset if isinstance(
             train_ds, torch.utils.data.Subset) else train_ds
+
+        # 根据 plans_dataset 和是否从零训练，构建模型实例
         model = self._MakeModel(plans_dataset, train_from_scratch)
+
+        # 设置模型的日志前缀，便于区分训练来源（从零训练 vs 继续训练）
         if train_from_scratch:
             model.SetLoggingPrefix('train_from_scratch/iter-{}-'.format(
                 self.curr_value_iter))
         else:
             model.SetLoggingPrefix('train/iter-{}-'.format(
                 self.curr_value_iter))
+
+        # 创建训练器（Trainer），传入训练数据加载器
         trainer = self._MakeTrainer(train_loader)
+
+        # 决定是否执行实际训练：
         if train_from_scratch:
+            # 如果是从零训练，直接进行训练（含验证）
             trainer.fit(model, train_loader, val_loader)
         elif not (self.curr_value_iter == 0 and p.skip_training_on_expert and
-                  (p.prev_replay_buffers_glob is None or
-                   p.agent_checkpoint is not None)):
-            # This condition only affects the first ever call to Train().
-            # Iteration 0 doesn't have a timeout limit, so during the second
-            # call to Train() we would always have self.curr_value_iter == 1.
+                (p.prev_replay_buffers_glob is None or
+                p.agent_checkpoint is not None)):
+            # 此分支处理“非从零训练”的情况，但需排除一种特殊情形：
+            #   - 当前是第 0 轮迭代（curr_value_iter == 0）
+            #   - 配置要求跳过专家数据上的训练（skip_training_on_expert=True）
+            #   - 并且（没有历史回放缓冲区 或 已提供 agent checkpoint）
+            # 这种情况下，第一次调用 Train() 时不进行训练（通常用于初始化阶段）。
+            #
+            # 注意：第 0 轮无超时限制；后续调用时 curr_value_iter >= 1，总会进入训练。
             trainer.fit(model, train_loader, val_loader)
+
+            # 训练完成后，保存训练好的模型（提取内部 nn.Module）
             self.model = model.model
-            # Optimizer state dict now available.
+
+            # 清除之前的优化器状态（为后续可能的继承做准备）
             self.prev_optimizer_state_dict = None
+
+            # 如果配置允许继承优化器状态，则保存当前优化器的状态字典
             if p.inherit_optimizer_state:
-                self.prev_optimizer_state_dict = trainer.optimizers[
-                    0].state_dict()
-        # Load best ckpt.
+                self.prev_optimizer_state_dict = trainer.optimizers[0].state_dict()
+
+        # 无论是否训练，都加载验证集上表现最好的检查点用于后续评估
         self._LoadBestCheckpointForEval(model, trainer)
+
+        # 停止 'train' 计时器
         self.timer.Stop('train')
+
+        # 返回训练后的模型包装对象和用于构建模型的数据集（plans_dataset）
         return model, plans_dataset
 
     def _SampleInternalNode(self, node):
@@ -1375,20 +1623,27 @@ class BalsaAgent(object):
         return predicted_latency, found_plan
 
     def PlanAndExecute(self, model, planner, is_test=False, max_retries=3):
+        """对 self.train_nodes（训练）或 self.test_nodes（测试）中的每个查询：
+        调用 planner 生成多个候选计划
+        用模型预测每个计划的代价（latency）
+        选择一个计划（通常是最优预测的那个）
+        执行该计划（真实数据库）
+        收集真实执行时间，用于强化学习或监督训练
+        """
         p = self.params
         model.eval()
-        to_execute = []
-        tasks = []
+        to_execute = [] # 记录要执行的 (SQL, hint) 对
+        tasks = [] # Ray 异步任务列表
         if p.sim:
-            sim = self.GetOrTrainSim()
+            sim = self.GetOrTrainSim() # 获取仿真模型（用于辅助预测）
         positions_of_min_predicted = []
-        nodes = self.test_nodes if is_test else self.train_nodes
+        nodes = self.test_nodes if is_test else self.train_nodes # 根据 is_test 选择使用测试集还是训练集节点
 
         # Plan the workload.
         kwargs = []
         task_lambdas = []
         exec_results = []
-        if not is_test:
+        if not is_test: # 训练时使用动态超时控制器（避免慢查询拖慢训练）
             self.timeout_controller.OnIterStart()
         planner_config = None
         if p.planner_config is not None:
@@ -1399,13 +1654,14 @@ class BalsaAgent(object):
                 p.epsilon_greedy_within_beam_search
 
         self.timer.Start('plan_test_set' if is_test else 'plan')
+        # 对每个查询节点进行规划
         for i, node in enumerate(nodes):
             print('---------------------------------------')
             tup = planner.plan(
                 node,
                 p.search_method,
                 bushy=p.bushy,
-                return_all_found=True,
+                return_all_found=True, # 返回所有找到的计划
                 verbose=False,
                 planner_config=planner_config,
                 epsilon_greedy=epsilon_greedy_within_beam_search,
@@ -1413,6 +1669,7 @@ class BalsaAgent(object):
                 avoid_eq_filters=is_test and p.avoid_eq_filters,
             )
             planning_time, found_plan, predicted_latency, found_plans = tup
+            # 现在默认计划found_plan，可能根据策略（如选预测代价最低的）重新选择计划
             predicted_latency, found_plan = self.SelectPlan(
                 found_plans, predicted_latency, found_plan, planner, node)
             print('{}q{}, predicted time: {:.1f}'.format(
@@ -1425,18 +1682,20 @@ class BalsaAgent(object):
                                               [tup[1] for tup in found_plans])
             # Model-predicted latency of the expert plan.  Allows us to track
             # what exactly the model thinks of the expert plan.
+            # 专家计划的模型预测延迟。用于跟踪模型对专家计划的具体评估。
             node.info['curr_predicted_latency'] = planner.infer(node, [node])[0]
             self.LogScalars([('predicted_latency_expert_plans/q{}'.format(
                 node.info['query_name']),
                               node.info['curr_predicted_latency'] / 1e3,
                               self.curr_value_iter)])
-
+            # 将计划转换为 SQL hint（如 /*+ Leading(...) */）
             hint_str = HintStr(found_plan,
                                with_physical_hints=p.plan_physical,
                                engine=p.engine)
             hinted_plan = found_plan
 
             # Launch tasks.
+            # 设置执行超时
             if is_test:
                 curr_timeout = None
 
@@ -1455,6 +1714,7 @@ class BalsaAgent(object):
             else:
                 exec_result = None
             exec_results.append(exec_result)
+            # 封装执行所需的所有上下文信息，供后续 Ray Task 使用
             kwarg = {
                 'query_name': node.info['query_name'],
                 'sql_str': node.info['sql_str'],
@@ -1472,17 +1732,16 @@ class BalsaAgent(object):
             }
 
             kwargs.append(kwarg)
-            if exec_result is None:
-                # Lambdas are late-binding; use a default argument value to
-                # ensure that when invoked later, the correct kwarg is used.
+            if exec_result is None: # 代表情况：缓存未命中
+                # Lambda 表达式是迟绑定的；使用默认参数值来确保在稍后调用时，使用的是正确的 kwarg。
                 fn = lambda task_index=i: ExecuteSql.options(resources={
                     f'node:{ray.util.get_node_ip_address()}': 1,
                 }).remote(**kwargs[task_index])
             else:
                 # Cache hit.  See comment above for why the default arg val.
                 fn = lambda task_index=i: ray.put(exec_results[task_index])
-            task_lambdas.append(fn)
-            tasks.append(fn())
+            task_lambdas.append(fn) # 保存 lambda 用于重试
+            tasks.append(fn()) # 立即调用，提交任务，获取 ObjectRef
 
             # Logging: which terminal plan is the predicted cheapest?
             min_p_latency = 1e30
@@ -1504,7 +1763,7 @@ class BalsaAgent(object):
         print('{}Waiting on Ray tasks...value_iter={}'.format(
             '[Test set] ' if is_test else '', self.curr_value_iter))
         try:
-            refs = ray.get(tasks)
+            refs = ray.get(tasks) # 阻塞等待所有任务完成
         except Exception as e:
             print('ray.get(tasks) received exception:', e)
             time.sleep(10)
@@ -1521,11 +1780,13 @@ class BalsaAgent(object):
             else:
                 print('Retries exhausted; raising the exception.')
                 raise e
+        
+        # 逐个处理每个任务的结果
         execution_results = []
         for i, task in enumerate(refs):
             result_tup = None
             is_cached_plan = True
-            if isinstance(task, ray.ObjectRef):
+            if isinstance(task, ray.ObjectRef): # 真实执行
                 # New plan: remote PG execution.
                 try:
                     result_tup = ray.get(task)
@@ -1569,30 +1830,31 @@ class BalsaAgent(object):
                     is_cached_plan = False
                     print('Retry succeeded.')
             elif isinstance(task, (pg_executor.Result, dbmsx_executor.Result)):
-                # New plan: local PG execution.
+                # New plan: local PG execution. # 说明 ExecuteSql 是本地调用（非 Ray）
                 result_tup = task
                 is_cached_plan = False
             else:
-                # This happens on a query execution cache hit.
+                # 代表情况:缓存命中，缓存结果格式为 ((result_tup,), metadata)
                 assert isinstance(task, tuple), task
                 assert len(task) == 2, task
-                # The cache records either a positive latency or -1 to indicate
-                # timeouts.  See FeedbackExecution().
-                # FIXME: is there a logic error here?  Cases: (1) cached
-                # execution didn't timeout, but its latency exceeded current
-                # timeout; (2) if relaxation enabled, the converse may happen:
-                # cached execution timed out before, but now timeout is bigger
-                # so it could've finished exec.
+                # 缓存中记录的要么是一个正的延迟值，要么是 -1，用以表示超时。参见 FeedbackExecution()。
+                # FIXME：此处是否存在逻辑错误？情况包括：
+                # (1) 缓存中的执行原本未超时，但其延迟超过了当前设定的超时时间；
+                # (2) 如果启用了超时放宽机制，则可能出现相反的情况：缓存中的执行之前因超时而失败，但当前超时时间更长，原本是可以成功完成执行的。
+
                 cached_result_tup = task[0][0]
                 result_tup = cached_result_tup
             assert isinstance(
                 result_tup,
                 (pg_executor.Result, dbmsx_executor.Result)), result_tup
+            
+            # 统一解析不同来源的结果（PG / DBMS-X / 缓存）
             result_tups = ParseExecutionResult(result_tup, **kwargs[i])
             assert len(result_tups) == 4
             print(result_tups[-1])  # Messages.
             execution_results.append(result_tups[:-1])
             # Increment counts for training.
+            # 更新训练统计
             if not is_test:
                 if is_cached_plan:
                     self.curr_iter_skipped_queries += 1
@@ -1825,68 +2087,102 @@ class BalsaAgent(object):
             use_plan_restrictions=p.real_use_plan_restrictions)
 
     def RunOneIter(self):
-        p = self.params
+        """
+        执行一次完整的训练-规划-执行-反馈迭代（即一个 value iteration）。
+        包括模型训练、查询计划生成、SQL 执行、经验反馈、日志记录、模型评估与移动平均更新等。
+        返回值：布尔值，表示本次迭代中是否发生了超时（timeout）。
+        """
+        p = self.params # 获取运行参数配置
+        # 初始化本次迭代中跳过的查询数量（用于提前停止判断）
         self.curr_iter_skipped_queries = 0
-        # Train the model.
-        model, dataset = self.Train()
-        # Replay buffer reset (if enabled).
+        # ───────────────────────────────────────
+        # 1. 模型训练阶段
+        # ───────────────────────────────────────
+        model, dataset = self.Train() # 训练当前迭代的模型，并返回训练数据集
+        # ───────────────────────────────────────
+        # 2. 经验回放缓冲区重置（如果启用）
+        # ───────────────────────────────────────
         if self.curr_value_iter == p.replay_buffer_reset_at_iter:
             self.exp.DropAgentExperience()
-
-        planner = self._MakePlanner(model, dataset)
-        # Use the model to plan the workload.  Execute the plans and get
-        # latencies.
+        # ───────────────────────────────────────
+        # 3. 构建查询规划器
+        # ───────────────────────────────────────
+        planner = self._MakePlanner(model, dataset)  # 基于当前模型和数据集创建规划器
+        # 使用模型为训练工作负载生成查询计划，提交执行并获取实际延迟结果
         to_execute, execution_results = self.PlanAndExecute(model,
                                                             planner,
                                                             is_test=False)
-        # Add exeuction results to the experience buffer.
+        # ───────────────────────────────────────
+        # 5. 反馈执行结果，更新经验缓冲区
+        # ───────────────────────────────────────
+        # 将执行结果（包括实际延迟、是否超时等）反馈给系统，用于后续训练
         iter_total_latency, has_timeouts = self.FeedbackExecution(
             to_execute, execution_results)
-        # Logging.
+        # ───────────────────────────────────────
+        # 6. 日志记录（仅在无超时情况下记录有效指标）
+        # ───────────────────────────────────────
         if not has_timeouts:
+            # 更新历史最佳训练延迟（单位：秒）
             self.overall_best_train_latency = min(
                 self.overall_best_train_latency, iter_total_latency / 1e3)
+            
+            # 准备要记录的标量指标（用于 TensorBoard / WandB 等）
             to_log = [
                 ('latency/workload', iter_total_latency / 1e3,
-                 self.curr_value_iter),
+                 self.curr_value_iter),# 当前工作负载总延迟
                 ('latency/workload_best', self.overall_best_train_latency,
-                 self.curr_value_iter),
-                ('num_query_execs', self.num_query_execs, self.curr_value_iter),
-                ('num_queries_with_eps_random', planner.num_queries_with_random,
-                 self.curr_value_iter),
+                 self.curr_value_iter),# 历史最佳
+                ('num_query_execs', self.num_query_execs, self.curr_value_iter),# 累计执行查询数
+                ('num_queries_with_eps_random', planner.num_queries_with_random, 
+                 self.curr_value_iter),# 使用 ε-随机探索的查询数
                 ('curr_iter_skipped_queries', self.curr_iter_skipped_queries,
-                 self.curr_value_iter),
-                ('curr_value_iter', self.curr_value_iter, self.curr_value_iter),
-                ('lr', model.learning_rate, self.curr_value_iter),
+                 self.curr_value_iter),# 本次跳过的查询数
+                ('curr_value_iter', self.curr_value_iter, self.curr_value_iter),# 当前迭代编号
+                ('lr', model.learning_rate, self.curr_value_iter),# 当前学习率
             ]
+            # 如果启用了迭代内学习率衰减，记录最终学习率
             if p.reduce_lr_within_val_iter:
                 to_log.append(('iter_final_lr', model.latest_per_iter_lr,
                                self.curr_value_iter))
+            # 批量记录标量指标
             self.LogScalars(to_log)
+        # ───────────────────────────────────────
+        # 7. 保存当前最佳计划（如延迟最低的计划）
+        # ───────────────────────────────────────
         self.SaveBestPlans()
+        # ───────────────────────────────────────
+        # 8. 定期保存智能体模型（每5轮）
+        # ───────────────────────────────────────
         if (self.curr_value_iter + 1) % 5 == 0:
             self.SaveAgent(model, iter_total_latency)
-        # Run and log test queries.
+        # ───────────────────────────────────────
+        # 9. 在测试集上评估当前模型性能
+        # ───────────────────────────────────────
         self.EvaluateTestSet(model, planner)
 
+        # ───────────────────────────────────────
+        # 10. 移动平均模型更新（用于更稳定的评估）
+        # ───────────────────────────────────────
         if p.track_model_moving_averages:
             # Update model averages.
-            # 1. EMA.  Aka Polyak averaging.
+            # 1. # (a) 指数移动平均（EMA / Polyak averaging）
             if self.curr_value_iter >= 0:
                 self.UpdateMovingAverage(model,
                                          moving_average='ema',
                                          ema_decay=p.ema_decay)
+                # 每5轮用 EMA 模型评估一次测试集
                 if (self.curr_value_iter + 1) % 5 == 0:
                     # Use EMA to evaluate test set too.
-                    self.SwapMovingAverage(model, moving_average='ema')
+                    self.SwapMovingAverage(model, moving_average='ema')# 切换到 EMA 权重
                     # Clear the planner's label cache.
-                    planner.SetModel(model)
-                    self.EvaluateTestSet(model, planner, tag='latency_test_ema')
-                    self.SwapMovingAverage(model, moving_average='ema')
+                    planner.SetModel(model)# 更新规划器使用的模型（清缓存）
+                    self.EvaluateTestSet(model, planner, tag='latency_test_ema') # 评估
+                    self.SwapMovingAverage(model, moving_average='ema')# 切回原始权重
 
-            # 2. SWA: Stochastic weight averaging.
-            if self.curr_value_iter >= 75:
+            # 2. # (b) 随机权重平均（SWA）
+            if self.curr_value_iter >= 75: # 从第75轮开始（经验性阈值）
                 self.UpdateMovingAverage(model, moving_average='swa')
+                # 每5轮用 SWA 模型评估一次测试集
                 if (self.curr_value_iter + 1) % 5 == 0:
                     self.SwapMovingAverage(model, moving_average='swa')
                     # Clear the planner's label cache.
@@ -1894,6 +2190,9 @@ class BalsaAgent(object):
                     self.EvaluateTestSet(model, planner, tag='latency_test_swa')
                     self.SwapMovingAverage(model, moving_average='swa')
 
+        # ───────────────────────────────────────
+        # 返回本次迭代是否发生超时，供外层控制迭代计数逻辑
+        # ───────────────────────────────────────
         return has_timeouts
 
     def SaveBestPlans(self):
@@ -2079,13 +2378,16 @@ class BalsaAgent(object):
         self.LogScalars(data_to_log)
 
     def Run(self):
+        # 获取参数对象，通常是一个包含各种配置选项的数据结构
         p = self.params
         if p.run_baseline:
             return self.RunBaseline()
         else:
-            self.curr_value_iter = 0
-            self.num_query_execs = 0
-            self.num_total_timeouts = 0
+            # 初始化或重置一些迭代器和计数器变量
+            self.curr_value_iter = 0  # 当前值迭代次数初始化为0
+            self.num_query_execs = 0  # 查询执行次数初始化为0
+            self.num_total_timeouts = 0  # 总超时次数初始化为0
+            # 初始化最佳延迟时间为无穷大，以便后续比较和更新
             self.overall_best_train_latency = np.inf
             self.overall_best_test_latency = np.inf
             self.overall_best_test_swa_latency = np.inf
@@ -2093,30 +2395,39 @@ class BalsaAgent(object):
             # For reporting cleaner hint strings for expert plans, remove their
             # unary ops (e.g., Aggregates).  These calls return copies, so
             # self.{all,train,test}_nodes no longer share any references.
+            # 过滤掉训练节点和测试节点中的一元操作（如聚合），以获得更清晰的提示字符串。
+            # 注意：这些调用返回的是副本，因此原始的{all,train,test}_nodes不再共享引用。
             self.train_nodes = plans_lib.FilterScansOrJoins(self.train_nodes)
             self.test_nodes = plans_lib.FilterScansOrJoins(self.test_nodes)
 
+        # 开始主循环，直到达到预设的迭代次数
         while self.curr_value_iter < p.val_iters:
+            # # 执行一个迭代，并检查是否有超时发生
             has_timeouts = self.RunOneIter()
+            # 记录当前迭代的时间信息
             self.LogTimings()
 
+            # 如果启用了基于跳过查询比例的提前停止机制，并且当前迭代跳过的查询数量超过设定的比例，则提前退出循环
             if (p.early_stop_on_skip_fraction is not None and
                     self.curr_iter_skipped_queries >=
                     p.early_stop_on_skip_fraction * len(self.train_nodes)):
                 break
 
+            # 如果启用缓存丢弃并且使用本地执行模式，则打印消息并丢弃缓冲区缓存
             if p.drop_cache and p.use_local_execution:
                 print('Dropping buffer cache.')
                 postgres.DropBufferCache()
 
+            # 根据是否在遇到超时时增加迭代计数器来决定如何处理迭代过程
             if p.increment_iter_despite_timeouts:
                 # Always increment the iteration counter.  This makes it fairer
                 # to compare runs with & without the timeout mechanism (or even
                 # between timeout runs).
+                # 始终增加迭代计数器。这使得在有无超时机制的运行之间进行比较更加公平.
                 self.curr_value_iter += 1
                 self.lr_schedule.Step()
                 if self.adaptive_lr_schedule is not None:
-                    self.adaptive_lr_schedule.Step()
+                    self.adaptive_lr_schedule.Step()  # 自适应学习率调度步骤（如果存在）
             else:
                 if has_timeouts:
                     # Don't count this value iter.
@@ -2124,8 +2435,12 @@ class BalsaAgent(object):
                     # have timeout events.  This can happen due to pg_executor
                     # encountering an out-of-memory / internal error and
                     # treating an execution as a timeout.
+                    # 若有超时发生，不计入当前迭代次数
+                    # 注意：即使在use_timeout=False的情况下也可能出现超时事件，
+                    # 这可能是由于pg_executor遇到了内存不足/内部错误而将执行视为超时。
                     pass
                 else:
+                    # 若没有超时，则正常增加迭代计数器并执行学习率调度步骤
                     self.curr_value_iter += 1
                     self.lr_schedule.Step()
                     if self.adaptive_lr_schedule is not None:
@@ -2138,6 +2453,7 @@ def Main(argv):
     print('Looking up params by name:', name)
     p = balsa.params_registry.Get(name)
 
+    # 下面这个 local 说明我们执行的那个启动命令是本地执行的
     p.use_local_execution = FLAGS.local
     # Override params here for quick debugging.
     # p.sim_checkpoint = None

@@ -94,7 +94,7 @@ def SqlToPlanNode(sql,
                   verbose=False,
                   keep_scans_joins_only=False,
                   cursor=None):
-    """Issues EXPLAIN(format json) on a SQL string; parse into our AST node."""
+    """对 SQL 字符串执行 EXPLAIN (FORMAT JSON)；将其解析为我们的抽象语法树（AST）节点。"""
     # Use of 'verbose' would alias-qualify all column names in pushed-down
     # filters, which are beneficial for us (e.g., this ensures that
     # Node.to_sql() returns a non-ambiguous SQL string).
