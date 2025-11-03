@@ -94,23 +94,67 @@ def SqlToPlanNode(sql,
                   verbose=False,
                   keep_scans_joins_only=False,
                   cursor=None):
-    """对 SQL 字符串执行 EXPLAIN (FORMAT JSON)；将其解析为我们的抽象语法树（AST）节点。"""
-    # Use of 'verbose' would alias-qualify all column names in pushed-down
-    # filters, which are beneficial for us (e.g., this ensures that
-    # Node.to_sql() returns a non-ambiguous SQL string).
-    # Ref: https://www.postgresql.org/docs/11/sql-explain.html
+    """
+    对给定的 SQL 字符串执行 PostgreSQL 的 EXPLAIN (FORMAT JSON) 命令，
+    并将返回的 JSON 计划解析为内部的抽象语法树（AST）节点（如 balsa.Node）。
+
+    Args:
+        sql (str): 要分析的 SQL 查询字符串。
+        comment (str, optional): 可选的注释字符串，通常用于在 EXPLAIN 前设置会话参数
+                                （例如临时关闭 GEQO 优化器）。若提供且非空，将影响执行计划。
+        verbose (bool): 是否在 EXPLAIN 中启用 verbose 模式。
+                        - 启用后，PostgreSQL 会在过滤条件中保留表别名（如 t1.col > 5），
+                          避免列名歧义，这对后续生成无歧义 SQL（如 node.to_sql()）非常关键。
+                        - 参考：https://www.postgresql.org/docs/11/sql-explain.html
+        keep_scans_joins_only (bool): 是否只保留计划中的 Scan 和 Join 节点。
+                                      - 若为 True，则会过滤掉 Aggregate、Sort、Limit 等非核心操作，
+                                        仅保留与连接顺序和扫描方式相关的节点，便于优化器聚焦。
+        cursor (psycopg2.cursor, optional): 可选的数据库游标。若未提供，函数内部会创建临时连接。
+
+    Returns:
+        tuple: (node, json_dict)
+            - node: 解析后的内部计划节点（balsa.Node 或其子类）。
+            - json_dict: PostgreSQL 返回的原始 EXPLAIN (FORMAT JSON) 结果（字典形式），
+                         可用于调试或进一步分析。
+
+    Note:
+        该函数是连接 PostgreSQL 执行计划与内部查询优化表示的核心桥梁。
+    """
+    # 判断是否需要关闭 GEQO（Genetic Query Optimizer）：
+    # 如果提供了非空的 comment（通常用于设置 GUC 参数，如 "set geqo = off"），
+    # 则认为用户希望精确控制计划生成（例如避免启发式优化干扰实验）。
     geqo_off = comment is not None and len(comment) > 0
-    result = _run_explain('explain(verbose, format json)',
-                          sql,
-                          comment,
-                          verbose,
-                          geqo_off=geqo_off,
-                          cursor=cursor).result
+
+    # 执行 EXPLAIN (verbose, format json) 命令：
+    # - 'verbose' 确保列名带表别名，避免歧义；
+    # - 若 geqo_off 为 True，会在执行前运行 comment 中的指令（如关闭 GEQO）；
+    # - 返回结果是一个嵌套结构，需逐层解包。
+    result = _run_explain(
+        'explain(verbose, format json)',
+        sql,
+        comment,
+        verbose,
+        geqo_off=geqo_off,
+        cursor=cursor
+    ).result
+
+    # 解包 PostgreSQL 返回的 JSON 结果：
+    # EXPLAIN (FORMAT JSON) 返回的是 [[{...}]] 形式的嵌套列表，
+    # result[0][0][0] 即为最内层的计划字典。
     json_dict = result[0][0][0]
+
+    # 将 PostgreSQL 的 JSON 计划转换为内部的 Node 对象（递归构建 AST）
     node = ParsePostgresPlanJson(json_dict)
+
+    # 根据 keep_scans_joins_only 标志决定是否过滤计划树：
     if not keep_scans_joins_only:
+        # 不过滤：返回完整计划树
         return node, json_dict
-    return plans_lib.FilterScansOrJoins(node), json_dict
+    else:
+        # 过滤：仅保留 Scan（如 SeqScan, IndexScan）和 Join（如 HashJoin, NestedLoop）节点，
+        # 移除 Aggregate、Sort、Materialize 等辅助操作，简化优化空间。
+        filtered_node = plans_lib.FilterScansOrJoins(node)
+        return filtered_node, json_dict
 
 
 def ExecuteSql(sql, hint=None, check_hint=False, verbose=False):

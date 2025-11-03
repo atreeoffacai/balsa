@@ -26,16 +26,49 @@ _EPSILON = 1e-6
 
 
 def ParseSqlToNode(path):
+    """
+    将指定路径的 SQL 文件解析为一个表示查询计划的 Node 对象（balsa.Node），
+    并附加原始 SQL、文件路径、查询名称及 PostgreSQL 的 EXPLAIN JSON 等元信息。
+
+    Args:
+        path (str): SQL 文件的完整路径（例如：'queries/job/q1.sql'）
+
+    Returns:
+        balsa.Node: 表示该 SQL 查询逻辑/物理计划的节点对象，包含丰富的元数据。
+    """
+    # 1. 从完整路径中提取文件名（不含目录），例如 'q1.sql'
     base = os.path.basename(path)
+    
+    # 2. 去掉文件扩展名，得到查询名称（例如 'q1'），用于标识该查询
     query_name = os.path.splitext(base)[0]
+    
+    # 3. 读取 SQL 文件内容为字符串
     with open(path, 'r') as f:
         sql_string = f.read()
+    
+    # 4. 调用 PostgreSQL 后端接口，将 SQL 字符串转换为计划树节点（Node）
+    #    同时返回对应的 EXPLAIN (FORMAT JSON) 结果（字典形式）
+    #    注意：SqlToPlanNode 可能会执行 EXPLAIN 并解析其输出
     node, json_dict = postgres.SqlToPlanNode(sql_string)
+    
+    # 5. 将原始文件路径存入 node 的 info 字典，便于后续追踪来源
     node.info['path'] = path
+    
+    # 6. 保存原始 SQL 字符串，方便调试或重放
     node.info['sql_str'] = sql_string
+    
+    # 7. 保存查询名称（如 'q1'），用于日志、可视化或结果命名
     node.info['query_name'] = query_name
+    
+    # 8. 保存 PostgreSQL 返回的 EXPLAIN JSON 原始数据，
+    #    可用于分析计划结构、代价估算、实际执行时间等
     node.info['explain_json'] = json_dict
+    
+    # 9. 确保 Node 内部已解析或缓存 SQL 相关信息（如表名、谓词等），
+    #    GetOrParseSql() 通常会触发一次 SQL 解析（如果尚未完成）
     node.GetOrParseSql()
+    
+    # 10. 返回填充了元数据的查询计划节点
     return node
 
 
@@ -155,41 +188,95 @@ class Workload(object):
 
 
 class JoinOrderBenchmark(Workload):
+    """
+    表示 Join Order Benchmark (JOB) 工作负载的类。
+    该类负责加载 JOB 查询集，并将其划分为训练集和测试集。
+    """
 
     @classmethod
     def Params(cls):
+        """
+        类方法：定义并返回该工作负载所需的参数配置。
+        这些参数将用于控制查询路径、搜索空间等行为。
+        """
+        # 调用父类（Workload）的 Params 方法，获取基础参数
         p = super().Params()
-        # Needs to be an absolute path for rllib.
+        
+        # 获取 balsa 模块所在目录的绝对路径，并向上回退一级（即项目根目录）
+        # 使用绝对路径是为了兼容 RLlib（Ray 的强化学习库），它要求路径是绝对的
         module_dir = os.path.abspath(os.path.dirname(balsa.__file__) + '/../')
+        
+        # 设置 JOB 查询文件所在的目录（相对于项目根目录）
         p.query_dir = os.path.join(module_dir, 'queries/join-order-benchmark')
+        
         return p
 
     def __init__(self, params):
+        """
+        初始化 JoinOrderBenchmark 实例。
+        
+        Args:
+            params: 包含配置参数的对象（通常由 Params() 生成）
+        """
+        # 调用父类的初始化方法
         super().__init__(params)
         p = params
-        self.query_nodes, self.train_nodes, self.test_nodes = \
-            self._LoadQueries()
+        
+        # 加载所有查询，并划分为：全部查询、训练查询、测试查询
+        self.query_nodes, self.train_nodes, self.test_nodes = self._LoadQueries()
+        
+        # 创建工作负载信息对象，用于后续计划生成和优化
         self.workload_info = plans_lib.WorkloadInfo(self.query_nodes)
-        self.workload_info.SetPhysicalOps(p.search_space_join_ops,
-                                          p.search_space_scan_ops)
+        
+        # 设置该工作负载允许使用的物理操作符（如 join 类型、scan 类型）
+        # 这些操作符定义了搜索空间的边界
+        self.workload_info.SetPhysicalOps(
+            p.search_space_join_ops,   # 允许的 join 操作符列表（如 HashJoin, NestedLoop 等）
+            p.search_space_scan_ops    # 允许的 scan 操作符列表（如 SeqScan, IndexScan 等）
+        )
 
     def _LoadQueries(self):
-        """Loads all queries into balsa.Node objects."""
+        """
+        从文件系统加载所有 SQL 查询文件，并转换为 balsa.Node 对象。
+        同时根据配置将查询划分为训练集和测试集。
+        
+        Returns:
+            tuple: (all_nodes, train_nodes, test_nodes)
+                - all_nodes: 所有查询对应的 Node 列表
+                - train_nodes: 用于训练的 Node 列表
+                - test_nodes: 用于测试的 Node 列表
+        """
         p = self.params
+        
+        # 1. 加载所有匹配 p.query_glob 模式的 SQL 文件路径（集合形式，去重）
         all_sql_set = self._get_sql_set(p.query_dir, p.query_glob)
+        
+        # 2. 加载测试集查询（匹配 p.test_query_glob 模式的 SQL 文件路径）
         test_sql_set = self._get_sql_set(p.query_dir, p.test_query_glob)
-        assert test_sql_set.issubset(all_sql_set)
-        # sorted by query id for easy debugging
+        
+        # 3. 确保测试集是全集的子集（逻辑校验）
+        assert test_sql_set.issubset(all_sql_set), "测试查询必须是全部查询的子集"
+        
+        # 4. 将所有 SQL 文件路径按名称排序（便于调试时顺序一致）
         all_sql_list = sorted(all_sql_set)
+        
+        # 5. 将每个 SQL 文件解析为 balsa.Node 对象（内部包含查询计划树等信息）
         all_nodes = [ParseSqlToNode(sqlfile) for sqlfile in all_sql_list]
-
+        
+        # 6. 划分训练集：
+        #    如果未指定测试查询模式（p.test_query_glob 为 None），则全部作为训练集；
+        #    否则，排除掉属于测试集的查询。
         train_nodes = [
             n for n in all_nodes
             if p.test_query_glob is None or n.info['path'] not in test_sql_set
         ]
+        
+        # 7. 划分测试集：仅包含在 test_sql_set 中的查询
         test_nodes = [n for n in all_nodes if n.info['path'] in test_sql_set]
-        assert len(train_nodes) > 0
-
+        
+        # 8. 确保训练集非空（防止配置错误导致无法训练）
+        assert len(train_nodes) > 0, "训练集不能为空"
+        
         return all_nodes, train_nodes, test_nodes
 
 

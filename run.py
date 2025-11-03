@@ -1654,7 +1654,7 @@ class BalsaAgent(object):
                 p.epsilon_greedy_within_beam_search
 
         self.timer.Start('plan_test_set' if is_test else 'plan')
-        # 对每个查询节点进行规划
+        # 对每个查询节点进行规划,一个node其实就是一个查询
         for i, node in enumerate(nodes):
             print('---------------------------------------')
             tup = planner.plan(
